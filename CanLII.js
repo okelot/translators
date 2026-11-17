@@ -9,7 +9,7 @@
 	"inRepository": true,
 	"translatorType": 4,
 	"browserSupport": "gcsibv",
-	"lastUpdated": "2026-10-29 17:33:24"
+	"lastUpdated": "2026-11-16 21:40:53"
 }
 
 /*
@@ -37,6 +37,11 @@
 
 
 var canLiiRegexp = /^https?:\/\/(?:www\.)?canlii\.org\/(?:en|fr)\/[^/]+\/[^/]+\/doc\//;
+// Commentary documents, e.g. /fr/doctrine/doc/2025CanLIIDocs1985 or /en/commentary/doc/2025CanLIIDocs1985
+var commentaryRegexp = /^https?:\/\/(?:www\.)?canlii\.org\/(?:en\/commentary|fr\/doctrine)\/doc\/([^/?#]+)/;
+// Statutes and regulations, e.g. /fr/ca/legis/lois/lrc-1985-c-c-46/derniere/lrc-1985-c-c-46.html
+// or /en/qc/laws/regu/cqlr-c-a-29-r-1/latest/cqlr-c-a-29-r-1.html
+var legislationRegexp = /^https?:\/\/(?:www\.)?canlii\.org\/(?:fr\/[^/]+\/legis|en\/[^/]+\/laws)\/[^/]+\/[^/]+\/[^/]+\/[^/?#]+\.html/;
 
 function clean(value) {
 	return (value || "").replace(/\s+/g, " ").trim();
@@ -60,6 +65,10 @@ function metadataValue(doc, labels) {
 }
 
 function detectWeb(doc, url) {
+	if (commentaryRegexp.test(url)) {
+		return meta(doc, "citation_journal_title") ? "journalArticle" : "document";
+	}
+	if (legislationRegexp.test(url)) return "statute";
 	if (canLiiRegexp.test(url)) return "case";
 	for (var link of doc.querySelectorAll("a[href]")) {
 		if (canLiiRegexp.test(link.href)) return "multiple";
@@ -102,6 +111,14 @@ function scrape(doc, url) {
 		item.court = citationMatch[3];
 		item.firstPage = citationMatch[4];
 	}
+	else if (citationMatch) {
+		// Cases without a neutral citation: keep the CanLII citation in the court
+		// field (e.g. "CanLII 17741 (QC CS)"), so that styles print "2000 CanLII 17741 (QC CS)".
+		item.notes.push({ note: (french ? "Référence CanLII : " : "CanLII citation: ") + citationMatch[2] + " " + citationMatch[3] + " " + citationMatch[4]
+			+ (citationMatch[5] ? " (" + citationMatch[5] + ")" : "")
+			+ (item.court ? (french ? "; Tribunal : " : "; Court: ") + item.court : "") });
+		item.court = citationMatch[3] + " " + citationMatch[4] + (citationMatch[5] ? " (" + citationMatch[5] + ")" : "");
+	}
 	var shortURL = doc.querySelector(".documentStaticUrl");
 	item.url = shortURL ? (shortURL.getAttribute("href") || clean(shortURL.textContent)) : url.replace(/[?#].*$/, "");
 	item.attachments.push({ url: url.replace(/\.html(?:[?#].*)?$/, ".pdf"), title: "CanLII Full Text PDF", mimeType: "application/pdf" });
@@ -109,8 +126,55 @@ function scrape(doc, url) {
 	item.complete();
 }
 
+async function scrapeCommentary(doc, url) {
+	var translator = Zotero.loadTranslator("web");
+	// Embedded Metadata
+	translator.setTranslator("951c027d-74ac-47d4-a107-9c3069ab7b48");
+	translator.setDocument(doc);
+	translator.setHandler("itemDone", function (obj, item) {
+		item.libraryCatalog = "CanLII";
+		// The page description repeats the citation; it is not an abstract.
+		delete item.abstractNote;
+		// The page scripts add the permalink; fall back to the page address.
+		var shortURL = doc.querySelector('a[href^="https://canlii.ca/t/"]');
+		item.url = shortURL ? shortURL.getAttribute("href") : url.replace(/[?#].*$/, "");
+		// The full-text link is also added by the page scripts, so build the PDF
+		// address from the document ID. The PDF replaces the page snapshot.
+		var id = url.match(commentaryRegexp)[1];
+		item.attachments = [{ url: "https://www.canlii.org/w/canlii/" + id + ".pdf", title: "CanLII Full Text PDF", mimeType: "application/pdf" }];
+		item.complete();
+	});
+	var em = await translator.getTranslatorObject();
+	await em.doWeb(doc, url);
+}
+
+function scrapeLegislation(doc, url) {
+	var item = new Zotero.Item("statute");
+	// The page title metadata reads "<code> | <name of act>",
+	// e.g. "LRC 1985, c C-46 | Code criminel".
+	var parts = meta(doc, "dc.title").split("|");
+	item.nameOfAct = meta(doc, "lbh-title") || clean(parts[parts.length - 1]);
+	if (parts.length > 1) item.code = clean(parts[0]);
+	// dc.language follows CanLII's interface language, not the language of the text.
+	var english = /^https?:\/\/(?:www\.)?canlii\.org\/en\//.test(url);
+	item.language = english ? "en" : "fr";
+	// Permalink to the latest version. Dated versions lack this row, so build
+	// the address of the latest version instead.
+	item.url = metadataValue(doc, ["lien vers la dernière version", "link to the latest version"])
+		|| url.replace(/\/[^/]+\/([^/?#]+\.html)(?:[?#].*)?$/, "/" + (english ? "latest" : "derniere") + "/$1");
+	// CanLII offers no PDF for legislation.
+	item.attachments.push({ document: doc, title: "CanLII Snapshot" });
+	item.complete();
+}
+
 async function doWeb(doc, url) {
-	if (canLiiRegexp.test(url)) {
+	if (commentaryRegexp.test(url)) {
+		await scrapeCommentary(doc, url);
+	}
+	else if (legislationRegexp.test(url)) {
+		scrapeLegislation(doc, url);
+	}
+	else if (canLiiRegexp.test(url)) {
 		scrape(doc, url);
 	}
 	else {
@@ -124,6 +188,7 @@ async function doWeb(doc, url) {
 
 // Site language is independent of the document URL language. The French
 // cases below expect the French interface selected in CanLII's language menu.
+
 /** BEGIN TEST CASES **/
 var testCases = [
 	{
@@ -363,6 +428,180 @@ var testCases = [
 						"note": "Référence neutre : 2026 QCCA 1417; Tribunal : Cour d'appel du Québec"
 					}
 				],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "https://www.canlii.org/fr/qc/qccs/doc/2000/2000canlii17741/2000canlii17741.html",
+		"items": [
+			{
+				"itemType": "case",
+				"caseName": "Malo c. Laoun",
+				"creators": [],
+				"dateDecided": "2000-01-12",
+				"court": "CanLII 17741 (QC CS)",
+				"docketNumber": "500-17-002955-980",
+				"url": "https://canlii.ca/t/1kg5g",
+				"attachments": [
+					{
+						"title": "CanLII Full Text PDF",
+						"mimeType": "application/pdf"
+					},
+					{
+						"title": "CanLII Snapshot",
+						"mimeType": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [
+					{
+						"note": "Autres références : [2000] RJQ 458 — EYB 2000-15944"
+					},
+					{
+						"note": "Référence CanLII : 2000 CanLII 17741 (QC CS); Tribunal : Cour supérieure du Québec"
+					}
+				],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "https://www.canlii.org/en/ns/nssc/doc/1990/1990canlii2604/1990canlii2604.html",
+		"items": [
+			{
+				"itemType": "case",
+				"caseName": "R. v. Nova Scotia Pharmaceutical Society",
+				"creators": [],
+				"dateDecided": "1990-09-05",
+				"court": "CanLII 2604 (NS SCTD)",
+				"docketNumber": "CR. No. 11486",
+				"url": "https://canlii.ca/t/1nx16",
+				"attachments": [
+					{
+						"title": "CanLII Full Text PDF",
+						"mimeType": "application/pdf"
+					},
+					{
+						"title": "CanLII Snapshot",
+						"mimeType": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [
+					{
+						"note": "Other Citations: 73 DLR (4th) 500 — 22 ACWS (3d) 779 — 263 APR 296 — 98 NSR (2d) 296 — 59 CCC (3d) 30 — 10 WCB (2d) 578 — 32 CPR (3d) 259"
+					},
+					{
+						"note": "CanLII citation: 1990 CanLII 2604 (NS SCTD); Court: Trial Division of the Supreme Court of Nova Scotia"
+					}
+				],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "https://www.canlii.org/fr/doctrine/doc/2025CanLIIDocs1985",
+		"defer": true,
+		"items": [
+			{
+				"itemType": "journalArticle",
+				"title": "Contributions civilistes à l’interprétation des lois constitutionnelles canadiennes",
+				"creators": [
+					{
+						"firstName": "Jérémy",
+						"lastName": "Boulanger-Bonnelly",
+						"creatorType": "author"
+					}
+				],
+				"date": "2025",
+				"issue": "2",
+				"language": "fr",
+				"libraryCatalog": "CanLII",
+				"pages": "203",
+				"publicationTitle": "Revue de droit de McGill",
+				"url": "https://canlii.ca/t/8wq70",
+				"volume": "70",
+				"attachments": [
+					{
+						"title": "CanLII Full Text PDF",
+						"mimeType": "application/pdf"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "https://www.canlii.org/fr/ca/legis/lois/lrc-1985-c-c-46/derniere/lrc-1985-c-c-46.html",
+		"items": [
+			{
+				"itemType": "statute",
+				"nameOfAct": "Code criminel",
+				"creators": [],
+				"code": "LRC 1985, c C-46",
+				"language": "fr",
+				"url": "https://canlii.ca/t/ckjd",
+				"attachments": [
+					{
+						"title": "CanLII Snapshot",
+						"mimeType": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "https://www.canlii.org/fr/qc/legis/regl/rlrq-c-a-29-r-1/derniere/rlrq-c-a-29-r-1.html",
+		"items": [
+			{
+				"itemType": "statute",
+				"nameOfAct": "Règlement sur l'admissibilité et l'inscription des personnes auprès de la Régie de l'assurance maladie du Québec",
+				"creators": [],
+				"code": "RLRQ c A-29, r 1",
+				"language": "fr",
+				"url": "https://canlii.ca/t/ch8d",
+				"attachments": [
+					{
+						"title": "CanLII Snapshot",
+						"mimeType": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "https://www.canlii.org/en/ca/laws/stat/rsc-1985-c-c-46/latest/rsc-1985-c-c-46.html",
+		"items": [
+			{
+				"itemType": "statute",
+				"nameOfAct": "Criminal Code",
+				"creators": [],
+				"code": "RSC 1985, c C-46",
+				"language": "en",
+				"url": "https://canlii.ca/t/7vf2",
+				"attachments": [
+					{
+						"title": "CanLII Snapshot",
+						"mimeType": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [],
 				"seeAlso": []
 			}
 		]
